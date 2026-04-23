@@ -1,0 +1,9 @@
+Datasets are publicly available at:
+
+Caltech-101:https://www.kaggle.com/datasets/imbikramsaha/caltech-101
+Cifar-100: pytorch (torchdivision.datasets.CIFAR100)
+Omniglot: pytorch (torchdivision.datasets.Omniglot)
+CUB-200: https://www.kaggle.com/datasets/wenewone/cub2002011
+EuroSat Land: https://www.kaggle.com/datasets/saipavansaketh/eurosatland
+ISIC (Skin Cancer): https://www.kaggle.com/datasets/nodoubttome/skin-cancer9-classesisic
+Chest X-Ray Pneumonia: https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia
