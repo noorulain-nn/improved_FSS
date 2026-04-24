@@ -276,15 +276,11 @@ class MemoryModule(nn.Module):
 
     # ── Phase 2: build novel prototypes ──────────────────────────────
     @torch.no_grad()
+
     def build_novel_prototype(self, support_features, support_masks, novel_cls_id):
-        """
-        Fix 2: Build fg + bg prototypes from K support images.
-        Accumulates across K shots then normalises — same as FSIC multi-shot mean.
-        Signatures and call site in main_seg.py are UNCHANGED.
-        """
         fg_accum = None
         bg_accum = None
-        count    = 0
+        count = 0
 
         for feat_i, mask_i in zip(support_features, support_masks):
             D, h, w = feat_i.shape[1:]
@@ -294,24 +290,32 @@ class MemoryModule(nn.Module):
             )
             valid = (mask_down != 255).float()
 
-            fg_mask  = mask_down * valid
-            fg_denom = fg_mask.sum(dim=[0, 2, 3]).clamp(min=1e-6)
-            fg_proto = (feat_i * fg_mask).sum(dim=[0, 2, 3]) / fg_denom
+            # ── NEW: confidence-weighted pooling ──────────────────────
+            # Instead of treating all foreground pixels equally,
+            # weight each pixel by its L2 norm (high-norm features
+            # are more "activated" and more reliable for the prototype).
+            feat_norm = feat_i.norm(dim=1, keepdim=True)  # [1, 1, h, w]
+            
+            fg_mask   = mask_down * valid
+            fg_weight = fg_mask * feat_norm               # weight by activation
+            fg_wsum   = fg_weight.sum(dim=[0,2,3]).clamp(min=1e-6)
+            fg_proto  = (feat_i * fg_weight).sum(dim=[0,2,3]) / fg_wsum
 
-            bg_mask  = (1.0 - mask_down) * valid
-            bg_denom = bg_mask.sum(dim=[0, 2, 3]).clamp(min=1e-6)
-            bg_proto = (feat_i * bg_mask).sum(dim=[0, 2, 3]) / bg_denom
+            bg_mask   = (1.0 - mask_down) * valid
+            bg_weight = bg_mask * feat_norm
+            bg_wsum   = bg_weight.sum(dim=[0,2,3]).clamp(min=1e-6)
+            bg_proto  = (feat_i * bg_weight).sum(dim=[0,2,3]) / bg_wsum
 
             fg_accum = fg_proto if fg_accum is None else fg_accum + fg_proto
             bg_accum = bg_proto if bg_accum is None else bg_accum + bg_proto
-            count   += 1
+            count += 1
 
         self.novel_prototypes[novel_cls_id] = F.normalize(
             fg_accum / count, p=2, dim=0
         )
         self.novel_bg_prototype = F.normalize(
             bg_accum / count, p=2, dim=0
-        )
+        )   
 
         print(f"[APM] Built fg+bg prototypes for novel class {novel_cls_id} "
               f"from {count} support image(s).")

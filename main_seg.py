@@ -73,6 +73,43 @@ criterion = nn.CrossEntropyLoss(ignore_index=255)
 # ─────────────────────────────────────────────────────────────────
 # Shared helper — compute loss for one batch
 # ─────────────────────────────────────────────────────────────────
+def dice_loss(pred_logits, target, eps=1e-6):
+    """
+    Works for both Phase 1 (31 slots) and Phase 2/3 (2 slots).
+    In Phase 1: extracts the foreground slot for the current class.
+    In Phase 2/3: slot 1 is always foreground.
+    """
+    if pred_logits.shape[1] == 2:
+        # Phase 2/3 — binary, slot 1 = foreground
+        fg_idx = 1
+    else:
+        # Phase 1 — multi-slot, but loss is still computed per-class
+        # CrossEntropy already handles slot selection via labels
+        # For dice, take the max activated slot as proxy for foreground
+        fg_idx = pred_logits.argmax(dim=1, keepdim=False)
+        # In this case use a simplified dice on the softmax confidence
+        pred_soft = torch.softmax(pred_logits, dim=1)
+        # Take the probability of the correct foreground pixels
+        # using the binary mask directly
+        valid    = (target != 255).float()
+        target_f = (target == 1).float() * valid
+        # Foreground confidence = max across all slots except bg(0)
+        fg_conf  = pred_soft[:, 1:].max(dim=1)[0] * valid
+        
+        intersection = (fg_conf * target_f).sum(dim=[1, 2])
+        union        = fg_conf.sum(dim=[1, 2]) + target_f.sum(dim=[1, 2])
+        dice = 1.0 - (2.0 * intersection + eps) / (union + eps)
+        return dice.mean()
+
+    pred_soft    = torch.softmax(pred_logits, dim=1)[:, fg_idx]
+    valid        = (target != 255).float()
+    target_f     = (target == 1).float() * valid
+    pred_f       = pred_soft * valid
+    intersection = (pred_f * target_f).sum(dim=[1, 2])
+    union        = pred_f.sum(dim=[1, 2]) + target_f.sum(dim=[1, 2])
+    dice         = 1.0 - (2.0 * intersection + eps) / (union + eps)
+    return dice.mean()
+    
 def compute_batch_loss(model, images, masks, class_labels, novel_cls_id=None):
     logits, fused = model(images, novel_cls_id)   # [B, slots, 56, 56]
 
@@ -97,7 +134,8 @@ def compute_batch_loss(model, images, masks, class_labels, novel_cls_id=None):
             logits_i = logits_full[i].unsqueeze(0)
 
         mask_i = masks[i].unsqueeze(0)
-        loss  += criterion(logits_i, mask_i)
+        # loss  += criterion(logits_i, mask_i)
+        loss  += criterion(logits_i, mask_i) + 0.5 *dice_loss(logits_i, mask_i)
         preds.append(logits_i.argmax(dim=1).squeeze(0))
 
     return loss / B, preds, fused
@@ -154,7 +192,7 @@ def phase1_train(fold, val_loader=None):
             loss, preds, fused = compute_batch_loss(model, images, masks, labels)
             loss.backward()
             # Clip gradients — prevents decoder BN instability when τ is large early on
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
 
             with torch.no_grad():
