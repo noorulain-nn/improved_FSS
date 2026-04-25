@@ -638,17 +638,7 @@ if __name__ == "__main__":
 
         # ── Run phases ────────────────────────────────────────────
         # phase1_train_miou = phase1_train(fold, val_loader=val_loader)
-        # ── Skip Phase 1 — load existing checkpoint ───────────────────
-        print(f"\n[Fold {fold}] Loading existing Phase 1 checkpoint...")
-        ckpt_path = f"{CHECKPOINT_DIR}/phase1_best_fold{fold}.pth"
-        if not os.path.exists(ckpt_path):
-            # fallback to current directory if running fresh
-            ckpt_path = f"phase1_best_fold{fold}.pth"
-        print(f"[Phase 2] Loading checkpoint: {ckpt_path}")
-        model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        phase1_train_miou = 0.0   # placeholder — not recomputed
-        print(f"[Fold {fold}] Checkpoint loaded. Skipping Phase 1 training.")
-
+        phase1_train_miou = phase1_train(fold, val_loader=None)     
         query_data, support_data = phase2_adapt(novel_dataset, novel_classes, K_SHOT, fold)
         novel_miou = phase3_test(fold, novel_classes, query_data, support_data)
 
