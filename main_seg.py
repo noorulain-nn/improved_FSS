@@ -54,6 +54,7 @@ NUM_EPOCHS       = 25
 LEARNING_RATE    = 3e-4      # backbone layer4 initial LR
 DECODER_LR       = 2e-4      # decoder initial LR
 IMG_SIZE         = 321
+DENSE_WEIGHT = 0.5   # blend weight: 0=prototype only, 1=dense only, 0.5=equal
 LR_MIN           = 1e-5      # CosineAnnealingLR eta_min
 PATIENCE         = 5
 VAL_FRACTION     = 0.0
@@ -192,7 +193,7 @@ def phase1_train(fold, val_loader=None):
             loss, preds, fused = compute_batch_loss(model, images, masks, labels)
             loss.backward()
             # Clip gradients — prevents decoder BN instability when τ is large early on
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             with torch.no_grad():
@@ -316,7 +317,9 @@ def phase2_adapt(novel_dataset, novel_classes, k_shot, fold):
     model.freeze_everything()
     model.eval()
 
-    query_data = {}
+# ── AFTER ───────────────────────────────────────────────────────
+    query_data   = {}
+    support_data = {}   # NEW: stores support feats+masks for dense matching
 
     for cls_id in novel_classes:
         cls_name = Data_Loader.VOC_CLASS_NAMES[cls_id]
@@ -341,14 +344,92 @@ def phase2_adapt(novel_dataset, novel_classes, k_shot, fold):
             support_feats, support_masks_list, cls_id
         )
 
+        # NEW: save support feats and masks for Phase 3 dense matching
+        support_data[cls_id] = {
+            "feats" : support_feats,        # list of K [1,256,h,w] tensors
+            "masks" : support_masks_list,   # list of K [1,H,W]  tensors
+        }
+
     print("\n[Phase 2] Novel prototypes built in decoder feature space.")
-    return query_data
+    return query_data, support_data   # NEW: return support_data too
 
 
 # ─────────────────────────────────────────────────────────────────
 # PHASE 3 — Test on novel classes + collect ROC scores
 # ─────────────────────────────────────────────────────────────────
-def phase3_test(fold, novel_classes, query_data):
+# ─────────────────────────────────────────────────────────────────
+# Dense support-query matching helper (PANet-lite)
+# ─────────────────────────────────────────────────────────────────
+def dense_match_score(query_feat, support_feats, support_masks):
+    """
+    For each query pixel, finds its maximum cosine similarity
+    against all FOREGROUND support pixels across all K support images.
+
+    This is the core of PANet-style matching — instead of comparing
+    against one averaged prototype vector, we compare against every
+    individual support foreground pixel and take the best match.
+
+    Parameters
+    ----------
+    query_feat    : [1, D, hq, wq]  — query decoder features
+    support_feats : list of K [1, D, hs, ws] tensors
+    support_masks : list of K [1, H, W]  tensors  (binary, 1=fg)
+
+    Returns
+    -------
+    dense_sim : [1, 1, hq, wq]  — per-pixel max foreground similarity
+                values in [0, 1], higher = more likely foreground
+    """
+    D  = query_feat.shape[1]
+    hq = query_feat.shape[2]
+    wq = query_feat.shape[3]
+
+    # Normalize query features
+    q_norm = F.normalize(query_feat, p=2, dim=1)   # [1, D, hq, wq]
+    q_flat = q_norm.view(1, D, hq * wq)            # [1, D, hq*wq]
+
+    best_sim = torch.full(
+        (1, hq * wq), -1.0, device=query_feat.device
+    )   # [1, hq*wq] — running max similarity per query pixel
+
+    for s_feat, s_mask in zip(support_feats, support_masks):
+        hs, ws = s_feat.shape[2], s_feat.shape[3]
+
+        # Downsample support mask to feature resolution
+        s_mask_down = F.interpolate(
+            s_mask.float().unsqueeze(1),
+            size=(hs, ws), mode="nearest"
+        ).squeeze(1)   # [1, hs, ws]
+
+        # Only keep foreground support pixels
+        fg_mask = (s_mask_down == 1).float()   # [1, hs, ws]
+        if fg_mask.sum() < 1:
+            continue
+
+        # Normalize support features
+        s_norm = F.normalize(s_feat, p=2, dim=1)   # [1, D, hs, ws]
+        s_flat = s_norm.view(1, D, hs * ws)         # [1, D, hs*ws]
+
+        # Apply foreground mask — zero out background support pixels
+        fg_flat = fg_mask.view(1, 1, hs * ws)       # [1, 1, hs*ws]
+        s_fg    = s_flat * fg_flat                   # [1, D, hs*ws]
+
+        # Cosine similarity: each query pixel vs all support fg pixels
+        # [1, hq*wq, D] x [1, D, hs*ws] -> [1, hq*wq, hs*ws]
+        sim_matrix = torch.bmm(
+            q_flat.permute(0, 2, 1),   # [1, hq*wq, D]
+            s_fg                        # [1, D, hs*ws]
+        )   # [1, hq*wq, hs*ws]
+
+        # For each query pixel: take max similarity over all support fg pixels
+        # Clamp to 0 so masked (zero) support pixels don't contribute
+        sim_max = sim_matrix.clamp(min=0).max(dim=2)[0]   # [1, hq*wq]
+
+        # Keep the best match across all K support images
+        best_sim = torch.max(best_sim, sim_max)
+
+    return best_sim.view(1, 1, hq, wq)   # [1, 1, hq, wq]
+def phase3_test(fold, novel_classes, query_data, support_data):
     """
     Evaluate on novel-class query images from VOC val (the test set).
     Collects:
@@ -389,12 +470,30 @@ def phase3_test(fold, novel_classes, query_data):
             cls_scores = []
             cls_labels = []
 
+            # ── AFTER (with dense matching) ─────────────────────────────────
+            s_feats = support_data[cls_id]["feats"]   # list of K [1,256,h,w]
+            s_masks = support_data[cls_id]["masks"]   # list of K [1,H,W]
+
             for q_img, q_mask in queries:
                 img_t  = q_img.unsqueeze(0).to(device)
                 mask_t = q_mask.unsqueeze(0).to(device)
 
-                logits, _ = model(img_t, novel_cls_id=cls_id)
-                # logits shape: [1, 2, h, w]  (slot0=bg, slot1=fg)
+                # Step 1: prototype-based cosine logits (existing)
+                logits, fused = model(img_t, novel_cls_id=cls_id)
+                # fused: [1, 256, hf, wf]   logits: [1, 2, hf, wf]
+
+                # Step 2: dense support-query matching (NEW)
+                dense_sim = dense_match_score(fused, s_feats, s_masks)
+                # dense_sim: [1, 1, hf, wf]  values in [0,1]
+
+                # Step 3: combine — scale dense_sim to logit range then add to fg
+                # We add to the fg channel (index 1) of the logits before interpolation
+                # Scaling by temperature τ keeps the magnitude consistent
+                tau = model.memory_module.temperature.clamp(1.0, 50.0).item()
+                logits[:, 1:2, :, :] = (
+                    logits[:, 1:2, :, :] + DENSE_WEIGHT * tau * dense_sim
+                )
+
                 logits_full = F.interpolate(
                     logits, size=(IMG_SIZE, IMG_SIZE),
                     mode="bilinear", align_corners=False,
@@ -403,12 +502,9 @@ def phase3_test(fold, novel_classes, query_data):
                 metrics.update(pred, mask_t)
 
                 # ── Collect ROC scores ────────────────────────
-                # Softmax → foreground probability → flatten
-                probs    = F.softmax(logits_full, dim=1)  # [1, 2, H, W]
-                fg_score = probs[0, 1].cpu().numpy().flatten()  # [H*W]
-                gt_flat  = q_mask.numpy().flatten()             # [H*W]
-
-                # Remove ignore pixels (255)
+                probs    = F.softmax(logits_full, dim=1)
+                fg_score = probs[0, 1].cpu().numpy().flatten()
+                gt_flat  = q_mask.numpy().flatten()
                 valid     = gt_flat != 255
                 cls_scores.append(fg_score[valid])
                 cls_labels.append(gt_flat[valid])
@@ -542,9 +638,19 @@ if __name__ == "__main__":
 
         # ── Run phases ────────────────────────────────────────────
         # phase1_train_miou = phase1_train(fold, val_loader=val_loader)
-        phase1_train_miou = phase1_train(fold, val_loader=None)
-        query_data        = phase2_adapt(novel_dataset, novel_classes, K_SHOT, fold)
-        novel_miou        = phase3_test(fold, novel_classes, query_data)
+        # ── Skip Phase 1 — load existing checkpoint ───────────────────
+        print(f"\n[Fold {fold}] Loading existing Phase 1 checkpoint...")
+        ckpt_path = f"{CHECKPOINT_DIR}/phase1_best_fold{fold}.pth"
+        if not os.path.exists(ckpt_path):
+            # fallback to current directory if running fresh
+            ckpt_path = f"phase1_best_fold{fold}.pth"
+        print(f"[Phase 2] Loading checkpoint: {ckpt_path}")
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        phase1_train_miou = 0.0   # placeholder — not recomputed
+        print(f"[Fold {fold}] Checkpoint loaded. Skipping Phase 1 training.")
+
+        query_data, support_data = phase2_adapt(novel_dataset, novel_classes, K_SHOT, fold)
+        novel_miou = phase3_test(fold, novel_classes, query_data, support_data)
 
         result = {
             "fold"       : fold,
