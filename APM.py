@@ -11,33 +11,34 @@ via the same EMA — no special treatment.
 
 This FSS extension keeps that exact philosophy:
   - Same adaptive EMA formula runs at Phase 1 (base) AND Phase 2 (novel)
-  - Novel classes get their own dedicated slots — same as base classes
   - The only FSS-specific addition is the fg/bg split (needed for
-    binary pixel-level decisions — classification doesn't need this)
+    binary pixel-level decisions — classification does not need this)
 
 SLOT LAYOUT (33 slots for 15 base classes)
 -------------------------------------------
-  Slot 0         → global background (fallback)
-  Slots  1-15    → foreground, one per base class
-  Slots 16-30    → class-specific background, one per base class
-  Slot 31        → novel class foreground   (FSIC-style novel slot)
-  Slot 32        → novel class background   (FSS-specific addition)
+  Slot 0         -> global background (fallback)
+  Slots  1-15    -> foreground, one per base class
+  Slots 16-30    -> class-specific background, one per base class
+  Slot 31        -> WORKING fg slot (EMA builds novel proto here)
+  Slot 32        -> WORKING bg slot (EMA builds novel proto here)
 
-WHY 33 NOT 31
---------------
-Previous version had 31 slots with no dedicated novel slots.
-Novel prototypes were stored outside the memory matrix in a separate
-dict. This broke the FSIC philosophy — novel and base classes were
-treated differently. Now novel classes have real memory slots and go
-through the same EMA as base classes.
+WHY WORKING SLOTS + DICT STORAGE
+----------------------------------
+  Slots 31 and 32 are TEMPORARY working slots used during Phase 2
+  to run the FSIC EMA over K support images. After each novel class
+  is processed, the result is CLONED into a per-class dictionary.
 
-SHARED EMA (_ema_update)
--------------------------
-Both Phase 1 base training and Phase 2 novel prototype building
-call the same _ema_update() method. This is the FSIC adaptive EMA:
-    alpha = clamp(1 - cosine_similarity, ALPHA_MIN, ALPHA_MAX)
-    slot  = (1 - alpha) * slot + alpha * new_prototype
-With a running-mean warm-up for the first WARMUP_N updates.
+  This gives you:
+    - FSIC-faithful EMA during prototype building (slots 31/32)
+    - Per-class storage so sequential novel classes do not
+      overwrite each other (dict)
+
+  This is exactly how FSIC works conceptually:
+    FSIC: EMA updates slot -> slot IS the classifier at test time
+    FSS:  EMA updates slot -> clone into dict -> dict used at test time
+    The EMA formula is identical. Storage is separate because
+    segmentation requires one prototype per class simultaneously,
+    whereas FSIC only ever tests one class at a time.
 """
 
 import torch
@@ -48,10 +49,10 @@ from Decoder import FPNDecoder
 
 
 # ── EMA hyper-parameters ─────────────────────────────────────────────
-ALPHA_MIN = 0.05    # prototype always moves at least this much
-ALPHA_MAX = 0.30    # one noisy batch can move it at most this much
-WARMUP_N  = 5       # use running mean for first N updates, then EMA
-TEMP_INIT = 10.0    # initial temperature
+ALPHA_MIN = 0.05
+ALPHA_MAX = 0.30
+WARMUP_N  = 5
+TEMP_INIT = 10.0
 TEMP_MIN  = 1.0
 TEMP_MAX  = 50.0
 
@@ -64,33 +65,31 @@ class MemoryModule(nn.Module):
         self.num_base_classes = num_base_classes
         self.feature_dim      = feature_dim
 
-        # ── Slot counts ───────────────────────────────────────────
-        self.NUM_GLOBAL_BG   = 1
-        self.NUM_FG_SLOTS    = num_base_classes       # 15
-        self.NUM_BG_SLOTS    = num_base_classes       # 15
-        self.NUM_NOVEL_SLOTS = 2                      # 1 fg + 1 bg
-        self.num_slots = (self.NUM_GLOBAL_BG
-                          + self.NUM_FG_SLOTS
-                          + self.NUM_BG_SLOTS
-                          + self.NUM_NOVEL_SLOTS)     # 33
+        # ── Slot counts ───────────────────────────────────────────────
+        # 1 global bg + 15 fg + 15 class-bg + 2 working novel slots = 33
+        self.num_slots = 1 + num_base_classes + num_base_classes + 2
 
-        # Memory matrix — EMA-updated, never touched by Adam
+        # Memory matrix — EMA updated, never touched by Adam
         self.memory = nn.Parameter(
             torch.randn(self.num_slots, feature_dim),
             requires_grad=False
         )
         nn.init.normal_(self.memory, mean=0.0, std=0.01)
 
-        # Learnable temperature — trained by Adam
+        # Learnable temperature — trained by Adam during Phase 1
         self.temperature = nn.Parameter(torch.tensor(TEMP_INIT))
 
-        # Per-slot update counter for warm-up logic
+        # Per-slot EMA update counter
         self.register_buffer(
             "n_seen", torch.zeros(self.num_slots, dtype=torch.long)
         )
 
-        # Tracks which novel class is currently loaded
-        self.novel_cls_to_slot = {}
+        # ── Per-class novel prototype storage ─────────────────────────
+        # Slots 31/32 are working slots used during Phase 2 EMA building.
+        # Results are cloned here so sequential novel classes do not
+        # overwrite each other. forward() reads from here during Phase 3.
+        self.novel_prototypes    = {}   # cls_id -> fg proto tensor [D]
+        self.novel_bg_prototypes = {}   # cls_id -> bg proto tensor [D]
 
         self._print_layout()
 
@@ -100,8 +99,9 @@ class MemoryModule(nn.Module):
         print(f"  Slot 0         -> global background")
         print(f"  Slots  1-{n:<2}    -> base class foreground")
         print(f"  Slots {n+1}-{2*n:<2}   -> base class-specific background")
-        print(f"  Slot {self.num_slots-2}         -> novel class foreground  (FSIC-style)")
-        print(f"  Slot {self.num_slots-1}         -> novel class background  (FSS addition)")
+        print(f"  Slot {self.num_slots-2}         -> working novel fg slot (Phase 2 EMA)")
+        print(f"  Slot {self.num_slots-1}         -> working novel bg slot (Phase 2 EMA)")
+        print(f"  Novel dict     -> per-class clones after EMA (Phase 3)")
         print(f"  Temperature    = {TEMP_INIT} (learnable)")
         print(f"  EMA alpha      = [{ALPHA_MIN}, {ALPHA_MAX}]")
         print(f"  Warm-up        = {WARMUP_N} updates\n")
@@ -119,15 +119,17 @@ class MemoryModule(nn.Module):
     def _novel_bg_slot(self):
         return self.num_slots - 1   # slot 32
 
-    # ── Core FSIC adaptive EMA — shared by Phase 1 and Phase 2 ───────
+    # ── Core FSIC adaptive EMA ────────────────────────────────────────
     def _ema_update(self, proto_new, slot_idx):
         """
-        The FSIC adaptive EMA formula.
-        Called identically for base classes (Phase 1) and
-        novel classes (Phase 2) — this is the methodological extension.
+        The FSIC adaptive EMA formula — shared by Phase 1 and Phase 2.
 
-        Warm-up: running mean for first WARMUP_N updates.
-        After:   alpha = clamp(1 - sim, ALPHA_MIN, ALPHA_MAX)
+        Phase 1: called for base class fg and bg slots
+        Phase 2: called for novel class working slots 31 and 32
+        Formula is identical both times — this is the FSIC extension.
+
+        Warm-up: running mean for first WARMUP_N updates (stable init)
+        After:   alpha = clamp(1 - cosine_sim, ALPHA_MIN, ALPHA_MAX)
                  slot  = (1-alpha)*slot + alpha*proto_new
         """
         n = self.n_seen[slot_idx].item()
@@ -157,19 +159,19 @@ class MemoryModule(nn.Module):
     # ── Attention-weighted masked pooling ─────────────────────────────
     def _pool_prototype(self, feature_map, mask):
         """
-        Pools feature_map over masked region using L2-norm attention.
-        High-norm spatial locations contribute more to the prototype.
-        Returns normalized [D] vector, or None if no valid pixels.
+        Attention-weighted masked average pooling.
+        Weights each spatial location by its L2 norm.
+        High-norm locations are more activated and more reliable.
+        Returns normalized [D] vector or None if no valid pixels.
         """
-        D, h, w = feature_map.shape[1:]
-
+        D, h, w   = feature_map.shape[1:]
         mask_down = F.interpolate(
             mask.float().unsqueeze(1), size=(h, w), mode="nearest"
         )
         valid     = (mask_down != 255).float()
         mask_down = mask_down * valid
 
-        if mask_down.sum() < 1:
+        if mask_down.sum() < 0.5:
             return None
 
         feat_norm = feature_map.norm(dim=1, keepdim=True)
@@ -179,12 +181,31 @@ class MemoryModule(nn.Module):
 
         return F.normalize(proto, p=2, dim=0)
 
+    def _simple_pool(self, feature_map, mask):
+        """
+        Simple masked average pooling — fallback when attention
+        pool finds no valid pixels (very small objects).
+        """
+        D, h, w   = feature_map.shape[1:]
+        mask_down = F.interpolate(
+            mask.float().unsqueeze(1), size=(h, w), mode="nearest"
+        ).squeeze(1)
+        valid     = (mask_down != 255).float()
+        mask_down = mask_down * valid
+        denom     = mask_down.sum().clamp(min=1e-6)
+        if denom < 0.1:
+            return None
+        proto = (
+            feature_map.squeeze(0) * mask_down.unsqueeze(0)
+        ).sum(dim=[1, 2]) / denom
+        return F.normalize(proto, p=2, dim=0)
+
     # ── Phase 1: base class batch update ─────────────────────────────
     def update_from_batch(self, feature_map, binary_masks, class_labels):
         """
         Called after each Phase 1 training batch (no gradient).
-        Updates fg slot, global bg slot, and class-specific bg slot
-        for each sample in the batch using _ema_update.
+        Updates fg slot, global bg slot, class-specific bg slot
+        for each sample using the shared _ema_update formula.
         """
         B = feature_map.shape[0]
 
@@ -196,11 +217,17 @@ class MemoryModule(nn.Module):
             fg_mask = (mask_i == 1).long()
             bg_mask = (mask_i == 0).long()
 
+            # Foreground
             fg_proto = self._pool_prototype(feat_i, fg_mask)
+            if fg_proto is None:
+                fg_proto = self._simple_pool(feat_i, fg_mask)
             if fg_proto is not None:
                 self._ema_update(fg_proto, self._fg_slot(cls))
 
+            # Background — global slot and class-specific slot
             bg_proto = self._pool_prototype(feat_i, bg_mask)
+            if bg_proto is None:
+                bg_proto = self._simple_pool(feat_i, bg_mask)
             if bg_proto is not None:
                 self._ema_update(bg_proto, slot_idx=0)
                 self._ema_update(bg_proto, self._bg_slot(cls))
@@ -210,15 +237,17 @@ class MemoryModule(nn.Module):
     def build_novel_prototype(self, support_features, support_masks,
                                novel_cls_id):
         """
-        Builds novel class prototypes using the same FSIC adaptive EMA
-        as Phase 1 base training.
+        Builds novel fg and bg prototypes using the same FSIC adaptive
+        EMA as Phase 1 base training.
 
-        FSIC at test time:  novel support image -> EMA update -> slot
-        FSS extension:      novel support image -> spatial masked pool
-                            -> EMA update -> dedicated novel slot
+        Step 1: Reset working slots 31 and 32
+        Step 2: Feed each support image through EMA into working slots
+                (identical formula to Phase 1 base class updates)
+        Step 3: Clone results into per-class dict
+                (so next novel class does not overwrite this one)
 
-        The _ema_update formula is identical in both phases.
-        fg and bg are both built — necessary for binary segmentation.
+        forward() reads from the dict during Phase 3 — not from slots.
+        This is why sequential novel classes work correctly.
 
         Parameters
         ----------
@@ -226,10 +255,10 @@ class MemoryModule(nn.Module):
         support_masks    : list of K tensors, each [1, H, W]
         novel_cls_id     : int
         """
-        fg_slot = self._novel_fg_slot()   # 31
-        bg_slot = self._novel_bg_slot()   # 32
+        fg_slot = self._novel_fg_slot()   # 31 — working slot
+        bg_slot = self._novel_bg_slot()   # 32 — working slot
 
-        # Reset slots — fresh start for this novel class
+        # Step 1: Reset working slots for this novel class
         self.memory.data[fg_slot] = torch.zeros(
             self.feature_dim, device=self.memory.device
         )
@@ -239,46 +268,66 @@ class MemoryModule(nn.Module):
         self.n_seen[fg_slot] = 0
         self.n_seen[bg_slot] = 0
 
+        # Step 2: FSIC EMA over K support images
         updates = 0
         for feat_i, mask_i in zip(support_features, support_masks):
 
             fg_mask = (mask_i == 1).long()
             bg_mask = (mask_i == 0).long()
 
+            # Foreground
             fg_proto = self._pool_prototype(feat_i, fg_mask)
+            if fg_proto is None:
+                fg_proto = self._simple_pool(feat_i, fg_mask)
             if fg_proto is not None:
                 self._ema_update(fg_proto, fg_slot)
 
+            # Background
             bg_proto = self._pool_prototype(feat_i, bg_mask)
+            if bg_proto is None:
+                bg_proto = self._simple_pool(feat_i, bg_mask)
             if bg_proto is not None:
                 self._ema_update(bg_proto, bg_slot)
 
             updates += 1
 
-        self.novel_cls_to_slot[novel_cls_id] = fg_slot
+        # Step 3: Clone into per-class dict BEFORE next class overwrites slots
+        self.novel_prototypes[novel_cls_id] = (
+            self.memory.data[fg_slot].clone()
+        )
+        self.novel_bg_prototypes[novel_cls_id] = (
+            self.memory.data[bg_slot].clone()
+        )
 
         print(f"[APM] Novel class {novel_cls_id}: "
               f"fg->slot{fg_slot}, bg->slot{bg_slot}, "
-              f"{updates} support image(s) via FSIC EMA")
+              f"{updates} support image(s) via FSIC EMA -> stored in dict")
 
     # ── Forward ───────────────────────────────────────────────────────
     def forward(self, feature_map, novel_cls_id=None):
         """
-        Phase 1 (novel_cls_id=None): compare against all 33 slots.
-        Phase 2/3 (novel_cls_id=int): binary [bg, fg] for novel class.
-        Returns temperature-scaled cosine logits [B, S, h, w].
+        Phase 1 (novel_cls_id=None):
+            Compare against all 33 memory slots.
+            Returns logits [B, 33, h, w].
+
+        Phase 2/3 (novel_cls_id=int):
+            Compare against [bg, fg] for this specific novel class.
+            Reads from per-class dict — not from working slots.
+            Returns logits [B, 2, h, w].
         """
         B, D, h, w = feature_map.shape
         feat_norm  = F.normalize(feature_map, p=2, dim=1)
 
         if novel_cls_id is None:
+            # Phase 1 — all slots
             mem = F.normalize(self.memory, p=2, dim=1)      # [33, D]
         else:
-            bg_proto = F.normalize(
-                self.memory.data[self._novel_bg_slot()], p=2, dim=0
-            )
+            # Phase 3 — read from per-class dict (not working slots)
             fg_proto = F.normalize(
-                self.memory.data[self._novel_fg_slot()], p=2, dim=0
+                self.novel_prototypes[novel_cls_id], p=2, dim=0
+            )
+            bg_proto = F.normalize(
+                self.novel_bg_prototypes[novel_cls_id], p=2, dim=0
             )
             mem = torch.stack([bg_proto, fg_proto], dim=0)  # [2, D]
 
@@ -311,9 +360,11 @@ class SegAPM(nn.Module):
         return logits, fused
 
     def freeze_for_novel(self):
+        """Freeze all weights for Phase 2/3."""
         for param in self.parameters():
             param.requires_grad = False
         print("[SegAPM] All weights frozen for Phase 2/3.")
+
     def freeze_everything(self):
-        return self.freeze_for_novel()   # alias for backward compatibility
-        
+        """Alias for backward compatibility with main_seg.py."""
+        return self.freeze_for_novel()
