@@ -314,3 +314,6 @@ class SegAPM(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
         print("[SegAPM] All weights frozen for Phase 2/3.")
+    def freeze_everything(self):
+        return self.freeze_for_novel()   # alias for backward compatibility
+        
