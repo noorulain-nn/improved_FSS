@@ -1,36 +1,34 @@
 """
-main_seg.py  —  FSS with FPN Decoder  (Benchmark-Compliant v3)
-===============================================================
+main_seg.py  —  FSS with FPN Decoder + Dense Matching
+======================================================
 
-CHANGES FROM v2:
-  1. DATA SPLIT — benchmark-correct two-split protocol
-       prepare_base_loaders() now returns (train_loader, n_base)  [2 values]
-       No Phase-1 validation loader — VOC val is the Phase-3 test set only
-       prepare_test_dataset() replaces prepare_novel_dataset()
+CHANGES FROM PREVIOUS VERSION:
+  1. Dense support-query matching added to Phase 3
+     - Blending done in PROBABILITY SPACE (not logit space)
+     - Fixes the "all pixels predicted as foreground" bug
+     - DENSE_WEIGHT = 0.4 (prototype 60%, dense matching 40%)
 
-  2. SCHEDULER — StepLR replaced with CosineAnnealingLR
-       Reference: Loshchilov & Hutter (2017), "SGDR: Stochastic Gradient
-       Descent with Warm Restarts", ICLR 2017
-       https://arxiv.org/abs/1608.03983
-       Used in HSNet (Min et al., ICCV 2021) and most modern FSS baselines.
+  2. Temperature LR lowered from 1e-2 to 1e-3
+     - Fixes gradient spikes in Folds 2 and 3
+     - tau still learns but cannot overshoot late in training
 
-  3. ROC CURVES — added in Phase 3
-       Pixel-level foreground probability scores are collected and passed
-       to Visualizer.plot_roc_curve() after each fold.
+  3. Temperature gradient hard-clamped after loss.backward()
+     - Additional protection against tau oscillation
 
-  4. phase1_validate() is REMOVED — no validation during Phase 1 in benchmark.
+  4. phase2_adapt now returns (query_data, support_data)
+     - support_data stores K support feats+masks per novel class
+     - Used by Phase 3 dense matching
 
-  5. Visualizer.plot_training_curves() call updated (no val arguments).
+  5. phase3_test now accepts support_data parameter
 
-EVERYTHING ELSE IS UNCHANGED:
-  3-phase structure, memory module, loss, metrics, fold loop.
+EVERYTHING ELSE UNCHANGED.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR   # ← changed from StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import os
 import numpy as np
 
@@ -51,68 +49,58 @@ BACKBONE_NAME    = "resnet50"
 DECODER_CHANNELS = 256
 BATCH_SIZE       = 16
 NUM_EPOCHS       = 25
-LEARNING_RATE    = 3e-4      # backbone layer4 initial LR
-DECODER_LR       = 2e-4      # decoder initial LR
+LEARNING_RATE    = 3e-4
+DECODER_LR       = 2e-4
 IMG_SIZE         = 321
-DENSE_WEIGHT = 0.5   # blend weight: 0=prototype only, 1=dense only, 0.5=equal
-LR_MIN           = 1e-5      # CosineAnnealingLR eta_min
+LR_MIN           = 1e-5
 PATIENCE         = 5
 VAL_FRACTION     = 0.0
 
-N_VIS_SAMPLES    = 6         # segmentation sample rows to plot
+# Dense matching weight — blend in probability space
+# 0.0 = prototype only (original behaviour)
+# 0.4 = prototype 60% + dense 40%  (recommended)
+# 1.0 = dense only
+DENSE_WEIGHT     = 0.4
+
+N_VIS_SAMPLES    = 6
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device} | Backbone: {BACKBONE_NAME} | {K_SHOT}-shot")
 print(f"Decoder: FPN out_channels={DECODER_CHANNELS}")
 print(f"Scheduler: CosineAnnealingLR  T_max={NUM_EPOCHS}  eta_min={LR_MIN}")
-print(f"Early stopping: patience={PATIENCE}  val_fraction={VAL_FRACTION}")
+print(f"Dense matching weight: {DENSE_WEIGHT}")
 print(f"Running {NUM_FOLDS} folds...")
 
 criterion = nn.CrossEntropyLoss(ignore_index=255)
 
 
 # ─────────────────────────────────────────────────────────────────
-# Shared helper — compute loss for one batch
+# Dice loss
 # ─────────────────────────────────────────────────────────────────
 def dice_loss(pred_logits, target, eps=1e-6):
-    """
-    Works for both Phase 1 (31 slots) and Phase 2/3 (2 slots).
-    In Phase 1: extracts the foreground slot for the current class.
-    In Phase 2/3: slot 1 is always foreground.
-    """
     if pred_logits.shape[1] == 2:
-        # Phase 2/3 — binary, slot 1 = foreground
         fg_idx = 1
+        pred_soft    = torch.softmax(pred_logits, dim=1)[:, fg_idx]
+        valid        = (target != 255).float()
+        target_f     = (target == 1).float() * valid
+        pred_f       = pred_soft * valid
+        intersection = (pred_f * target_f).sum(dim=[1, 2])
+        union        = pred_f.sum(dim=[1, 2]) + target_f.sum(dim=[1, 2])
+        dice         = 1.0 - (2.0 * intersection + eps) / (union + eps)
+        return dice.mean()
     else:
-        # Phase 1 — multi-slot, but loss is still computed per-class
-        # CrossEntropy already handles slot selection via labels
-        # For dice, take the max activated slot as proxy for foreground
-        fg_idx = pred_logits.argmax(dim=1, keepdim=False)
-        # In this case use a simplified dice on the softmax confidence
         pred_soft = torch.softmax(pred_logits, dim=1)
-        # Take the probability of the correct foreground pixels
-        # using the binary mask directly
-        valid    = (target != 255).float()
-        target_f = (target == 1).float() * valid
-        # Foreground confidence = max across all slots except bg(0)
-        fg_conf  = pred_soft[:, 1:].max(dim=1)[0] * valid
-        
+        valid     = (target != 255).float()
+        target_f  = (target == 1).float() * valid
+        fg_conf   = pred_soft[:, 1:].max(dim=1)[0] * valid
         intersection = (fg_conf * target_f).sum(dim=[1, 2])
         union        = fg_conf.sum(dim=[1, 2]) + target_f.sum(dim=[1, 2])
-        dice = 1.0 - (2.0 * intersection + eps) / (union + eps)
+        dice         = 1.0 - (2.0 * intersection + eps) / (union + eps)
         return dice.mean()
 
-    pred_soft    = torch.softmax(pred_logits, dim=1)[:, fg_idx]
-    valid        = (target != 255).float()
-    target_f     = (target == 1).float() * valid
-    pred_f       = pred_soft * valid
-    intersection = (pred_f * target_f).sum(dim=[1, 2])
-    union        = pred_f.sum(dim=[1, 2]) + target_f.sum(dim=[1, 2])
-    dice         = 1.0 - (2.0 * intersection + eps) / (union + eps)
-    return dice.mean()
-    
+
 def compute_batch_loss(model, images, masks, class_labels, novel_cls_id=None):
-    logits, fused = model(images, novel_cls_id)   # [B, slots, 56, 56]
+    logits, fused = model(images, novel_cls_id)
 
     logits_full = F.interpolate(
         logits, size=(IMG_SIZE, IMG_SIZE),
@@ -135,37 +123,87 @@ def compute_batch_loss(model, images, masks, class_labels, novel_cls_id=None):
             logits_i = logits_full[i].unsqueeze(0)
 
         mask_i = masks[i].unsqueeze(0)
-        # loss  += criterion(logits_i, mask_i)
-        loss  += criterion(logits_i, mask_i) + 0.5 *dice_loss(logits_i, mask_i)
+        loss  += criterion(logits_i, mask_i) + 0.5 * dice_loss(logits_i, mask_i)
         preds.append(logits_i.argmax(dim=1).squeeze(0))
 
     return loss / B, preds, fused
 
 
 # ─────────────────────────────────────────────────────────────────
-# PHASE 1 — Train on base classes (no validation)
+# Dense support-query matching helper
 # ─────────────────────────────────────────────────────────────────
-def phase1_train(fold, val_loader=None):
+def dense_match_score(query_feat, support_feats, support_masks):
     """
-    Train the backbone + FPN decoder on base classes for NUM_EPOCHS.
+    For each query pixel, finds its maximum cosine similarity
+    against all FOREGROUND support pixels across all K support images.
 
-    Benchmark protocol: NO validation set.  Training uses the full
-    merged VOC+SBD train list.  The best model is saved at the epoch
-    with the lowest training loss (proxy for Phase-1 checkpoint selection).
+    This is PANet-lite style matching — instead of one averaged
+    prototype vector, we compare against every individual support
+    foreground pixel and take the best match per query pixel.
+
+    Returns values in [0, 1] — safe to blend in probability space.
 
     Parameters
     ----------
-    fold : int   current cross-validation fold
+    query_feat    : [1, D, hq, wq]
+    support_feats : list of K [1, D, hs, ws] tensors
+    support_masks : list of K [1, H, W]  tensors (binary, 1=fg)
 
     Returns
     -------
-    best_train_miou : float  highest training mIoU seen across all epochs
+    dense_sim : [1, 1, hq, wq]  per-pixel max foreground similarity
     """
+    D  = query_feat.shape[1]
+    hq = query_feat.shape[2]
+    wq = query_feat.shape[3]
+
+    q_norm = F.normalize(query_feat, p=2, dim=1)   # [1, D, hq, wq]
+    q_flat = q_norm.view(1, D, hq * wq)             # [1, D, hq*wq]
+
+    best_sim = torch.full(
+        (1, hq * wq), -1.0, device=query_feat.device
+    )
+
+    for s_feat, s_mask in zip(support_feats, support_masks):
+        hs, ws = s_feat.shape[2], s_feat.shape[3]
+
+        # Downsample support mask to feature resolution
+        s_mask_down = F.interpolate(
+            s_mask.float().unsqueeze(1),
+            size=(hs, ws), mode="nearest"
+        ).squeeze(1)   # [1, hs, ws]
+
+        fg_mask = (s_mask_down == 1).float()
+        if fg_mask.sum() < 1:
+            continue
+
+        s_norm = F.normalize(s_feat, p=2, dim=1)    # [1, D, hs, ws]
+        s_flat = s_norm.view(1, D, hs * ws)           # [1, D, hs*ws]
+
+        # Zero out background support pixels
+        fg_flat = fg_mask.view(1, 1, hs * ws)
+        s_fg    = s_flat * fg_flat                    # [1, D, hs*ws]
+
+        # Each query pixel vs all support fg pixels
+        sim_matrix = torch.bmm(
+            q_flat.permute(0, 2, 1),   # [1, hq*wq, D]
+            s_fg                        # [1, D,     hs*ws]
+        )   # [1, hq*wq, hs*ws]
+
+        # Best match per query pixel, clamp negatives
+        sim_max = sim_matrix.clamp(min=0).max(dim=2)[0]   # [1, hq*wq]
+        best_sim = torch.max(best_sim, sim_max)
+
+    return best_sim.view(1, 1, hq, wq)   # [1, 1, hq, wq] in [0, 1]
+
+
+# ─────────────────────────────────────────────────────────────────
+# PHASE 1
+# ─────────────────────────────────────────────────────────────────
+def phase1_train(fold, val_loader=None):
     print("\n" + "="*60)
     print(f"  PHASE 1 — Training on BASE classes  (Fold {fold})")
     print(f"  Scheduler: CosineAnnealingLR  T_max={NUM_EPOCHS}  eta_min={LR_MIN}")
-    if val_loader is not None:
-        print(f"  Early stopping: patience={PATIENCE} (internal val)")
     print("="*60)
 
     best_train_miou  = 0.0
@@ -192,8 +230,15 @@ def phase1_train(fold, val_loader=None):
             optimizer.zero_grad()
             loss, preds, fused = compute_batch_loss(model, images, masks, labels)
             loss.backward()
-            # Clip gradients — prevents decoder BN instability when τ is large early on
+
+            # Clip total gradient norm
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # FIXED: hard-clamp temperature gradient separately
+            # prevents tau from overshooting late in training
+            if model.memory_module.temperature.grad is not None:
+                model.memory_module.temperature.grad.clamp_(-0.5, 0.5)
+
             optimizer.step()
 
             with torch.no_grad():
@@ -253,9 +298,7 @@ def phase1_train(fold, val_loader=None):
                 print(f"  checkpoint saved  (val mIoU={best_val_miou*100:.2f}%)")
             else:
                 no_improve += 1
-                print(f"  No val improvement for {no_improve}/{PATIENCE} epochs")
 
-        # Save checkpoint at best (lowest) training loss
         if val_loader is None and avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(model.state_dict(), f"phase1_best_fold{fold}.pth")
@@ -264,23 +307,17 @@ def phase1_train(fold, val_loader=None):
         if train_miou > best_train_miou:
             best_train_miou = float(train_miou)
 
-        scheduler.step()   # CosineAnnealingLR — step every epoch
+        scheduler.step()
 
         if val_loader is not None and no_improve >= PATIENCE:
             early_stop_epoch = epoch + 1
-            print(f"\n  [Early Stopping] No validation improvement for "
-                  f"{PATIENCE} epochs. Best epoch = {best_epoch}.")
             model.load_state_dict(
                 torch.load(f"phase1_best_fold{fold}.pth", map_location=device)
             )
             break
 
     print(f"\n[Phase 1 Fold {fold}] Best train mIoU = {best_train_miou*100:.2f}%")
-    if val_loader is not None:
-        print(f"[Phase 1 Fold {fold}] Best val   mIoU = {best_val_miou*100:.2f}%"
-              f"  (epoch {best_epoch})")
 
-    # ── Plot training curves (no val) ────────────────────────────
     Visualizer.plot_training_curves(
         fold         = fold,
         train_losses = train_losses,
@@ -290,21 +327,11 @@ def phase1_train(fold, val_loader=None):
         early_stop_epoch = early_stop_epoch if val_loader is not None else None,
     )
 
-    if val_loader is not None and val_mious:
-        Visualizer.plot_early_stopping(
-            fold          = fold,
-            train_mious   = train_mious,
-            val_mious     = val_mious,
-            best_epoch    = best_epoch,
-            patience      = PATIENCE,
-            stopped_epoch = early_stop_epoch,
-        )
-
     return best_train_miou
 
 
 # ─────────────────────────────────────────────────────────────────
-# PHASE 2 — Adapt to novel classes  (unchanged from v2)
+# PHASE 2
 # ─────────────────────────────────────────────────────────────────
 def phase2_adapt(novel_dataset, novel_classes, k_shot, fold):
     print("\n" + "="*60)
@@ -317,9 +344,8 @@ def phase2_adapt(novel_dataset, novel_classes, k_shot, fold):
     model.freeze_everything()
     model.eval()
 
-# ── AFTER ───────────────────────────────────────────────────────
     query_data   = {}
-    support_data = {}   # NEW: stores support feats+masks for dense matching
+    support_data = {}   # stores support feats+masks for Phase 3 dense matching
 
     for cls_id in novel_classes:
         cls_name = Data_Loader.VOC_CLASS_NAMES[cls_id]
@@ -344,112 +370,33 @@ def phase2_adapt(novel_dataset, novel_classes, k_shot, fold):
             support_feats, support_masks_list, cls_id
         )
 
-        # NEW: save support feats and masks for Phase 3 dense matching
+        # Save for Phase 3 dense matching
         support_data[cls_id] = {
-            "feats" : support_feats,        # list of K [1,256,h,w] tensors
-            "masks" : support_masks_list,   # list of K [1,H,W]  tensors
+            "feats" : support_feats,        # list of K [1,256,h,w]
+            "masks" : support_masks_list,   # list of K [1,H,W]
         }
 
-    print("\n[Phase 2] Novel prototypes built in decoder feature space.")
-    return query_data, support_data   # NEW: return support_data too
+    print("\n[Phase 2] Novel prototypes built. Support features cached.")
+    return query_data, support_data
 
 
 # ─────────────────────────────────────────────────────────────────
-# PHASE 3 — Test on novel classes + collect ROC scores
+# PHASE 3
 # ─────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────
-# Dense support-query matching helper (PANet-lite)
-# ─────────────────────────────────────────────────────────────────
-def dense_match_score(query_feat, support_feats, support_masks):
-    """
-    For each query pixel, finds its maximum cosine similarity
-    against all FOREGROUND support pixels across all K support images.
-
-    This is the core of PANet-style matching — instead of comparing
-    against one averaged prototype vector, we compare against every
-    individual support foreground pixel and take the best match.
-
-    Parameters
-    ----------
-    query_feat    : [1, D, hq, wq]  — query decoder features
-    support_feats : list of K [1, D, hs, ws] tensors
-    support_masks : list of K [1, H, W]  tensors  (binary, 1=fg)
-
-    Returns
-    -------
-    dense_sim : [1, 1, hq, wq]  — per-pixel max foreground similarity
-                values in [0, 1], higher = more likely foreground
-    """
-    D  = query_feat.shape[1]
-    hq = query_feat.shape[2]
-    wq = query_feat.shape[3]
-
-    # Normalize query features
-    q_norm = F.normalize(query_feat, p=2, dim=1)   # [1, D, hq, wq]
-    q_flat = q_norm.view(1, D, hq * wq)            # [1, D, hq*wq]
-
-    best_sim = torch.full(
-        (1, hq * wq), -1.0, device=query_feat.device
-    )   # [1, hq*wq] — running max similarity per query pixel
-
-    for s_feat, s_mask in zip(support_feats, support_masks):
-        hs, ws = s_feat.shape[2], s_feat.shape[3]
-
-        # Downsample support mask to feature resolution
-        s_mask_down = F.interpolate(
-            s_mask.float().unsqueeze(1),
-            size=(hs, ws), mode="nearest"
-        ).squeeze(1)   # [1, hs, ws]
-
-        # Only keep foreground support pixels
-        fg_mask = (s_mask_down == 1).float()   # [1, hs, ws]
-        if fg_mask.sum() < 1:
-            continue
-
-        # Normalize support features
-        s_norm = F.normalize(s_feat, p=2, dim=1)   # [1, D, hs, ws]
-        s_flat = s_norm.view(1, D, hs * ws)         # [1, D, hs*ws]
-
-        # Apply foreground mask — zero out background support pixels
-        fg_flat = fg_mask.view(1, 1, hs * ws)       # [1, 1, hs*ws]
-        s_fg    = s_flat * fg_flat                   # [1, D, hs*ws]
-
-        # Cosine similarity: each query pixel vs all support fg pixels
-        # [1, hq*wq, D] x [1, D, hs*ws] -> [1, hq*wq, hs*ws]
-        sim_matrix = torch.bmm(
-            q_flat.permute(0, 2, 1),   # [1, hq*wq, D]
-            s_fg                        # [1, D, hs*ws]
-        )   # [1, hq*wq, hs*ws]
-
-        # For each query pixel: take max similarity over all support fg pixels
-        # Clamp to 0 so masked (zero) support pixels don't contribute
-        sim_max = sim_matrix.clamp(min=0).max(dim=2)[0]   # [1, hq*wq]
-
-        # Keep the best match across all K support images
-        best_sim = torch.max(best_sim, sim_max)
-
-    return best_sim.view(1, 1, hq, wq)   # [1, 1, hq, wq]
 def phase3_test(fold, novel_classes, query_data, support_data):
     """
-    Evaluate on novel-class query images from VOC val (the test set).
-    Collects:
-      - per-class mIoU and pixel accuracy
-      - foreground probability scores for ROC curve computation
-      - segmentation sample images for visual inspection
+    Evaluate on novel-class query images.
+    Combines prototype-based cosine similarity (existing)
+    with dense support-query pixel matching (new).
 
-    Parameters
-    ----------
-    fold          : int
-    novel_classes : list[int]
-    query_data    : dict  cls_id → list[(q_img, q_mask)]
-
-    Returns
-    -------
-    mean_novel_miou : float
+    Blending is done in PROBABILITY SPACE:
+      fg_prob = (1-DENSE_WEIGHT)*proto_fg_prob + DENSE_WEIGHT*dense_sim
+    This prevents the "all foreground" bug caused by logit-space addition.
     """
     print("\n" + "="*60)
     print(f"  PHASE 3 — Testing on NOVEL classes  (Fold {fold})")
     print(f"  Test set: VOC2012 val  (benchmark protocol)")
+    print(f"  Dense matching weight: {DENSE_WEIGHT}")
     print("="*60)
 
     model.eval()
@@ -458,7 +405,7 @@ def phase3_test(fold, novel_classes, query_data, support_data):
     per_class_accs  = []
     class_name_list = []
     vis_samples     = []
-    roc_data        = {}     # ← for ROC curves: {cls_name: {scores, labels}}
+    roc_data        = {}
 
     with torch.no_grad():
         for cls_id in novel_classes:
@@ -466,49 +413,63 @@ def phase3_test(fold, novel_classes, query_data, support_data):
             queries  = query_data[cls_id]
             metrics  = Metrics.SegMetrics(num_classes=2)
 
-            # Accumulators for this class's ROC data
+            # Get support features for this class
+            s_feats = support_data[cls_id]["feats"]
+            s_masks = support_data[cls_id]["masks"]
+
             cls_scores = []
             cls_labels = []
-
-            # ── AFTER (with dense matching) ─────────────────────────────────
-            s_feats = support_data[cls_id]["feats"]   # list of K [1,256,h,w]
-            s_masks = support_data[cls_id]["masks"]   # list of K [1,H,W]
 
             for q_img, q_mask in queries:
                 img_t  = q_img.unsqueeze(0).to(device)
                 mask_t = q_mask.unsqueeze(0).to(device)
 
-                # Step 1: prototype-based cosine logits (existing)
+                # ── Step 1: prototype cosine logits ───────────────────
                 logits, fused = model(img_t, novel_cls_id=cls_id)
-                # fused: [1, 256, hf, wf]   logits: [1, 2, hf, wf]
+                # logits: [1, 2, hf, wf]   fused: [1, 256, hf, wf]
 
-                # Step 2: dense support-query matching (NEW)
+                # ── Step 2: dense pixel matching ──────────────────────
                 dense_sim = dense_match_score(fused, s_feats, s_masks)
-                # dense_sim: [1, 1, hf, wf]  values in [0,1]
+                # dense_sim: [1, 1, hf, wf]  values in [0, 1]
 
-                # Step 3: combine — scale dense_sim to logit range then add to fg
-                # We add to the fg channel (index 1) of the logits before interpolation
-                # Scaling by temperature τ keeps the magnitude consistent
-                tau = model.memory_module.temperature.clamp(1.0, 50.0).item()
-                logits[:, 1:2, :, :] = (
-                    logits[:, 1:2, :, :] + DENSE_WEIGHT * tau * dense_sim
-                )
+                # ── Step 3: blend in PROBABILITY SPACE ───────────────
+                # Convert prototype logits to probabilities first,
+                # then blend with dense similarity scores.
+                # Both signals are in [0,1] so no overflow is possible.
+                proto_probs = F.softmax(logits, dim=1)  # [1, 2, hf, wf]
 
+                fg_combined = (
+                    (1.0 - DENSE_WEIGHT) * proto_probs[:, 1:2, :, :]
+                    + DENSE_WEIGHT        * dense_sim.clamp(0.0, 1.0)
+                )   # [1, 1, hf, wf]
+                bg_combined = 1.0 - fg_combined  # [1, 1, hf, wf]
+
+                # Stack back to [1, 2, hf, wf] for upsample + argmax
+                logits_combined = torch.cat(
+                    [bg_combined, fg_combined], dim=1
+                )   # [1, 2, hf, wf]
+
+                # ── Step 4: upsample and predict ─────────────────────
                 logits_full = F.interpolate(
-                    logits, size=(IMG_SIZE, IMG_SIZE),
+                    logits_combined,
+                    size=(IMG_SIZE, IMG_SIZE),
                     mode="bilinear", align_corners=False,
                 )
                 pred = logits_full.argmax(dim=1)
                 metrics.update(pred, mask_t)
 
-                # ── Collect ROC scores ────────────────────────
-                probs    = F.softmax(logits_full, dim=1)
-                fg_score = probs[0, 1].cpu().numpy().flatten()
+                # ── ROC scores ────────────────────────────────────────
+                # Use fg_combined (already probabilities) for ROC
+                fg_full  = F.interpolate(
+                    fg_combined,
+                    size=(IMG_SIZE, IMG_SIZE),
+                    mode="bilinear", align_corners=False,
+                )
+                fg_score = fg_full[0, 0].cpu().numpy().flatten()
                 gt_flat  = q_mask.numpy().flatten()
-                valid     = gt_flat != 255
+                valid    = gt_flat != 255
                 cls_scores.append(fg_score[valid])
                 cls_labels.append(gt_flat[valid])
-                # ─────────────────────────────────────────────
 
             _, cls_miou, cls_acc = metrics.compute()
             all_mious.append(cls_miou)
@@ -516,7 +477,6 @@ def phase3_test(fold, novel_classes, query_data, support_data):
             per_class_accs.append(float(cls_acc))
             class_name_list.append(cls_name)
 
-            # Concatenate all pixels for this class
             roc_data[cls_name] = {
                 "scores": np.concatenate(cls_scores),
                 "labels": np.concatenate(cls_labels),
@@ -526,18 +486,27 @@ def phase3_test(fold, novel_classes, query_data, support_data):
                   f"mIoU={cls_miou*100:.2f}%  PixAcc={cls_acc*100:.2f}%  "
                   f"({len(queries)} query images)")
 
-            # ── Collect segmentation samples ──────────────────
+            # ── Visualisation samples ─────────────────────────────────
             if len(vis_samples) < N_VIS_SAMPLES:
                 for q_img, q_mask in queries:
                     if len(vis_samples) >= N_VIS_SAMPLES:
                         break
-                    img_t  = q_img.unsqueeze(0).to(device)
-                    logits, _ = model(img_t, novel_cls_id=cls_id)
-                    logits_full = F.interpolate(
-                        logits, size=(IMG_SIZE, IMG_SIZE),
+                    img_t = q_img.unsqueeze(0).to(device)
+
+                    logits_v, fused_v = model(img_t, novel_cls_id=cls_id)
+                    dense_v  = dense_match_score(fused_v, s_feats, s_masks)
+                    probs_v  = F.softmax(logits_v, dim=1)
+                    fg_v     = (
+                        (1.0 - DENSE_WEIGHT) * probs_v[:, 1:2, :, :]
+                        + DENSE_WEIGHT * dense_v.clamp(0.0, 1.0)
+                    )
+                    bg_v     = 1.0 - fg_v
+                    comb_v   = torch.cat([bg_v, fg_v], dim=1)
+                    full_v   = F.interpolate(
+                        comb_v, size=(IMG_SIZE, IMG_SIZE),
                         mode="bilinear", align_corners=False,
                     )
-                    pred_mask = logits_full.argmax(dim=1).squeeze(0)
+                    pred_mask = full_v.argmax(dim=1).squeeze(0)
 
                     sm = Metrics.SegMetrics(num_classes=2)
                     sm.update(pred_mask.unsqueeze(0), q_mask.unsqueeze(0))
@@ -550,12 +519,10 @@ def phase3_test(fold, novel_classes, query_data, support_data):
                         "class_name": cls_name,
                         "iou"       : float(sample_iou),
                     })
-            # ─────────────────────────────────────────────────
 
     mean_novel_miou = sum(all_mious) / len(all_mious)
     print(f"\n[Phase 3 Fold {fold}] Mean novel mIoU = {mean_novel_miou*100:.2f}%")
 
-    # ── Save Phase 3 plots ────────────────────────────────────────
     Visualizer.plot_per_class_iou(
         fold           = fold,
         class_names    = class_name_list,
@@ -567,13 +534,13 @@ def phase3_test(fold, novel_classes, query_data, support_data):
         samples   = vis_samples,
         n_samples = N_VIS_SAMPLES,
     )
-    Visualizer.plot_roc_curve(fold=fold, roc_data=roc_data)   # ← NEW
+    Visualizer.plot_roc_curve(fold=fold, roc_data=roc_data)
 
     return mean_novel_miou
 
 
 # ─────────────────────────────────────────────────────────────────
-# RUN — Loop over all folds
+# RUN
 # ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     fold_results = []
@@ -583,7 +550,6 @@ if __name__ == "__main__":
         print(f"#  FOLD {fold}  /  {NUM_FOLDS}")
         print(f"{'#'*70}\n")
 
-        # ── Load data (CHANGED: 2 return values) ─────────────────
         train_loader, _, NUM_BASE = Data_Loader.prepare_base_loaders(
             voc_root    = VOC_ROOT,
             sbd_root    = SBD_ROOT,
@@ -591,13 +557,11 @@ if __name__ == "__main__":
             batch_size  = BATCH_SIZE,
             val_fraction= VAL_FRACTION,
         )
-        # Novel dataset = test set (VOC val)
         novel_dataset, novel_classes = Data_Loader.prepare_test_dataset(
             voc_root = VOC_ROOT,
             fold     = fold,
         )
 
-        # ── Build model ───────────────────────────────────────────
         backbone, feat_dims = Models.load_backbone(BACKBONE_NAME)
         model = APM.SegAPM(
             backbone             = backbone,
@@ -605,7 +569,6 @@ if __name__ == "__main__":
             decoder_out_channels = DECODER_CHANNELS,
         ).to(device)
 
-        # ── Optimiser ─────────────────────────────────────────────
         optimizer = optim.Adam([
             {
                 "params": model.backbone.layer4.parameters(),
@@ -619,28 +582,31 @@ if __name__ == "__main__":
                 "weight_decay": 1e-4,
             },
             {
-                # Temperature τ: one scalar, learns fast.
-                # High LR is intentional — τ needs to find its working range
-                # (roughly 10–30) within the first few epochs.
                 "params": [model.memory_module.temperature],
-                "lr"    : 1e-2,
+                "lr"    : 1e-3,    # FIXED: was 1e-2, caused gradient spikes
                 "name"  : "temperature",
             },
         ])
-            # ── Scheduler: CosineAnnealingLR ──────────────────────────
-        # Smoothly decays LR from initial value to eta_min over T_max epochs.
-        # Reference: Loshchilov & Hutter, ICLR 2017, https://arxiv.org/abs/1608.03983
+
         scheduler = CosineAnnealingLR(
             optimizer,
             T_max   = NUM_EPOCHS,
             eta_min = LR_MIN,
         )
 
-        # ── Run phases ────────────────────────────────────────────
-        # phase1_train_miou = phase1_train(fold, val_loader=val_loader)
-        phase1_train_miou = phase1_train(fold, val_loader=None)     
-        query_data, support_data = phase2_adapt(novel_dataset, novel_classes, K_SHOT, fold)
-        novel_miou = phase3_test(fold, novel_classes, query_data, support_data)
+        # ── To skip Phase 1 and use existing checkpoints: ─────────────
+        # Comment out phase1_train and set phase1_train_miou = 0.0
+        # phase2_adapt loads the checkpoint internally.
+        #
+        # phase1_train_miou = 0.0  # skip training, use existing .pth
+        #
+        phase1_train_miou = phase1_train(fold, val_loader=None)
+        query_data, support_data = phase2_adapt(
+            novel_dataset, novel_classes, K_SHOT, fold
+        )
+        novel_miou = phase3_test(
+            fold, novel_classes, query_data, support_data
+        )
 
         result = {
             "fold"       : fold,
@@ -656,7 +622,6 @@ if __name__ == "__main__":
         print(f"  Phase 3 mIoU (novel)       = {novel_miou*100:.2f}%")
         print(f"  Setting: Fold={fold} | {K_SHOT}-shot | {BACKBONE_NAME} + FPN")
 
-    # ── Final summary ─────────────────────────────────────────────
     print(f"\n\n{'='*60}")
     print("  SUMMARY ACROSS ALL FOLDS")
     print(f"{'='*60}")
